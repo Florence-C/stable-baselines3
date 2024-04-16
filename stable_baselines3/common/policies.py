@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar, Union
 
 import numpy as np
 import torch as th
+import torch_geometric as thg
 from gymnasium import spaces
 from torch import nn
 
@@ -29,6 +30,8 @@ from stable_baselines3.common.torch_layers import (
     MlpExtractor,
     NatureCNN,
     create_mlp,
+    GraphFeaturesExtractor, 
+    GNNModule
 )
 from stable_baselines3.common.type_aliases import PyTorchObs, Schedule
 from stable_baselines3.common.utils import get_device, is_vectorized_observation, obs_as_tensor
@@ -985,3 +988,482 @@ class ContinuousCritic(BaseModel):
         with th.no_grad():
             features = self.extract_features(obs, self.features_extractor)
         return self.q_networks[0](th.cat([features, actions], dim=1))
+
+
+#GNN AC Policy where the whole network is a GNN 
+
+class GNNActorCriticPolicy(ActorCriticPolicy):
+    """
+    Policy class for actor-critic algorithms (has both policy and value prediction).
+    Used by A2C, PPO and the likes.
+
+    :param observation_space: Observation space
+    :param action_space: Action space
+    :param lr_schedule: Learning rate schedule (could be constant)
+    :param net_arch: The specification of the policy and value networks.
+    :param activation_fn: Activation function
+    :param ortho_init: Whether to use or not orthogonal initialization
+    :param use_sde: Whether to use State Dependent Exploration or not
+    :param log_std_init: Initial value for the log standard deviation
+    :param full_std: Whether to use (n_features x n_actions) parameters
+        for the std instead of only (n_features,) when using gSDE
+    :param use_expln: Use ``expln()`` function instead of ``exp()`` to ensure
+        a positive standard deviation (cf paper). It allows to keep variance
+        above zero and prevent it from growing too fast. In practice, ``exp()`` is usually enough.
+    :param squash_output: Whether to squash the output using a tanh function,
+        this allows to ensure boundaries when using gSDE.
+    :param features_extractor_class: Features extractor to use.
+    :param features_extractor_kwargs: Keyword arguments
+        to pass to the features extractor.
+    :param share_features_extractor: If True, the features extractor is shared between the policy and value networks.
+    :param normalize_images: Whether to normalize images or not,
+         dividing by 255.0 (True by default)
+    :param optimizer_class: The optimizer to use,
+        ``th.optim.Adam`` by default
+    :param optimizer_kwargs: Additional keyword arguments,
+        excluding the learning rate, to pass to the optimizer
+    """
+
+    def __init__(
+        self,
+        # observation_space: spaces.Space,
+        observation_space: spaces.Graph,
+        action_space: spaces.Space,
+        lr_schedule: Schedule,
+        net_arch: Optional[Union[List[int], Dict[str, List[int]]]] = None,
+        activation_fn: Type[nn.Module] = nn.Tanh,
+        ortho_init: bool = True,
+        use_sde: bool = False,
+        log_std_init: float = 0.0,
+        full_std: bool = True,
+        use_expln: bool = False,
+        squash_output: bool = False,
+        features_extractor_class: Type[BaseFeaturesExtractor] = GraphFeaturesExtractor,
+        features_extractor_kwargs: Optional[Dict[str, Any]] = None,
+        share_features_extractor: bool = True,
+        normalize_images: bool = True,
+        optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
+        optimizer_kwargs: Optional[Dict[str, Any]] = None,
+    ):
+        if optimizer_kwargs is None:
+            optimizer_kwargs = {}
+            # Small values to avoid NaN in Adam optimizer
+            if optimizer_class == th.optim.Adam:
+                optimizer_kwargs["eps"] = 1e-5
+
+        super().__init__(
+            observation_space,
+            action_space,
+            lr_schedule, 
+            net_arch,
+            activation_fn,
+            ortho_init,
+            use_sde, 
+            log_std_init, 
+            full_std, 
+            use_expln, 
+            squash_output,
+            features_extractor_class,
+            features_extractor_kwargs,
+            share_features_extractor,
+            normalize_images, 
+            optimizer_class,
+            optimizer_kwargs,
+        )
+
+
+    def _build_gnn_extractor(self) -> None:
+        """
+        Create the policy and value networks.
+        Part of the layers can be shared.
+        """
+        # Note: If net_arch is None and some features extractor is used,
+        #       net_arch here is an empty list and mlp_extractor does not
+        #       really contain any layers (acts like an identity module).
+        self.mlp_extractor = GNNExtractor(
+            self.features_dim,
+            net_arch=self.net_arch,
+            activation_fn=self.activation_fn,
+            device=self.device,
+        )
+
+
+    def _build(self, lr_schedule: Schedule) -> None:
+        """
+        Create the networks and the optimizer.
+
+        :param lr_schedule: Learning rate schedule
+            lr_schedule(1) is the initial learning rate
+        """
+
+        self.gnn = GNNModule(self.observation_space)
+
+
+        # latent_dim_pi = self.mlp_extractor.latent_dim_pi
+
+        # if isinstance(self.action_dist, DiagGaussianDistribution):
+        #     self.action_net, self.log_std = self.action_dist.proba_distribution_net(
+        #         latent_dim=latent_dim_pi, log_std_init=self.log_std_init
+        #     )
+        # elif isinstance(self.action_dist, StateDependentNoiseDistribution):
+        #     self.action_net, self.log_std = self.action_dist.proba_distribution_net(
+        #         latent_dim=latent_dim_pi, latent_sde_dim=latent_dim_pi, log_std_init=self.log_std_init
+        #     )
+        # elif isinstance(self.action_dist, (CategoricalDistribution, MultiCategoricalDistribution, BernoulliDistribution)):
+        #     self.action_net = self.action_dist.proba_distribution_net(latent_dim=latent_dim_pi)
+        # else:
+        #     raise NotImplementedError(f"Unsupported distribution '{self.action_dist}'.")
+
+        # self.value_net = nn.Linear(self.mlp_extractor.latent_dim_vf, 1)
+
+
+        self.value_net = self.gnn.value_net
+        self.action_net = self.gnn.policy_net
+        self.log_std = nn.Parameter(th.ones(self.action_dist.action_dim) * self.log_std_init, requires_grad=True)
+
+        # Init weights: use orthogonal initialization
+        # with small initial weight for the output
+        if self.ortho_init:
+            # TODO: check for features_extractor
+            # Values from stable-baselines.
+            # features_extractor/mlp values are
+            # originally from openai/baselines (default gains/init_scales).
+            module_gains = {
+                #self.features_extractor: np.sqrt(2),
+                #self.mlp_extractor: np.sqrt(2),
+                self.action_net: 0.01,
+                self.value_net: 1,
+            }
+            # if not self.share_features_extractor:
+            #     # Note(antonin): this is to keep SB3 results
+            #     # consistent, see GH#1148
+            #     del module_gains[self.features_extractor]
+            #     module_gains[self.pi_features_extractor] = np.sqrt(2)
+            #     module_gains[self.vf_features_extractor] = np.sqrt(2)
+
+            for module, gain in module_gains.items():
+                module.apply(partial(self.init_weights, gain=gain))
+
+        # Setup optimizer with initial learning rate
+        self.optimizer = self.optimizer_class(self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs)  # type: ignore[call-arg]
+
+
+    def obs_to_tensor(self, observation: spaces.GraphInstance):
+        if isinstance(observation, list):
+            vectorized_env = True
+        else:
+            vectorized_env = False
+        if vectorized_env:
+            torch_obs = list()
+            for obs in observation:
+                x = th.tensor(obs.nodes).float()
+                edge_index = th.tensor(obs.edge_links, dtype=th.long).t().contiguous().view(2, -1)
+                torch_obs.append(thg.data.Data(x=x, edge_index=edge_index))
+            if len(torch_obs) == 1:
+                torch_obs = torch_obs[0]
+        else:
+            x = th.tensor(observation.nodes).float()
+            edge_index = th.tensor(observation.edge_links, dtype=th.long).t().contiguous().view(2, -1)
+            torch_obs = thg.data.Data(x=x, edge_index=edge_index)
+        return torch_obs, vectorized_env
+
+   
+    def forward(self, obs: thg.data.Data, deterministic: bool = False) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
+        """
+        Forward pass in all the networks (actor and critic)
+
+        :param obs: Observation
+        :param deterministic: Whether to sample or use deterministic actions
+        :return: action, value and log probability of the action
+        """
+        # Preprocess the observation if needed
+        # features = self.extract_features(obs)
+        # if self.share_features_extractor:
+        #     latent_pi, latent_vf = self.mlp_extractor(features)
+        # else:
+        #     pi_features, vf_features = features
+        #     latent_pi = self.mlp_extractor.forward_actor(pi_features)
+        #     latent_vf = self.mlp_extractor.forward_critic(vf_features)
+        # # Evaluate the values for the given observations
+        # values = self.value_net(latent_vf)
+
+        values = self.gnn.forward_critic(obs)
+
+        distribution = self._get_action_dist_from_obs(obs)
+        actions = distribution.get_actions(deterministic=deterministic)
+        log_prob = distribution.log_prob(actions)
+        actions = actions.reshape((-1, *self.action_space.shape))  # type: ignore[misc]
+        return actions, values, log_prob
+
+
+    def _predict(self, observation: thg.data.Data, deterministic: bool = False) -> th.Tensor:
+        """
+        Get the action according to the policy for a given observation.
+
+        :param observation:
+        :param deterministic: Whether to use stochastic or deterministic actions
+        :return: Taken action according to the policy
+        """
+        action = self.get_distribution(observation).get_actions(deterministic=deterministic)
+        print("action = ", action, action.shape)
+        return action
+
+    def _get_action_dist_from_obs(self, observation: thg.data.Data) -> Distribution:
+        """
+        Retrieve action distribution given the latent codes.
+
+        :param latent_pi: Latent code for the actor
+        :return: Action distribution
+        """
+        mean_actions = self.gnn.forward_actor(observation)
+
+        # print('mean_actions = ', mean_actions, mean_actions.shape)
+
+        if isinstance(self.action_dist, DiagGaussianDistribution):
+            return self.action_dist.proba_distribution(mean_actions, self.log_std)
+        elif isinstance(self.action_dist, CategoricalDistribution):
+            # Here mean_actions are the logits before the softmax
+            return self.action_dist.proba_distribution(action_logits=mean_actions)
+        elif isinstance(self.action_dist, MultiCategoricalDistribution):
+            # Here mean_actions are the flattened logits
+            return self.action_dist.proba_distribution(action_logits=mean_actions)
+        elif isinstance(self.action_dist, BernoulliDistribution):
+            # Here mean_actions are the logits (before rounding to get the binary actions)
+            return self.action_dist.proba_distribution(action_logits=mean_actions)
+        elif isinstance(self.action_dist, StateDependentNoiseDistribution):
+            return self.action_dist.proba_distribution(mean_actions, self.log_std, latent_pi)
+        else:
+            raise ValueError("Invalid action distribution")
+
+    def evaluate_actions(self, obs: thg.data.Data, actions: th.Tensor) -> Tuple[th.Tensor, th.Tensor, Optional[th.Tensor]]:
+        """
+        Evaluate actions according to the current policy,
+        given the observations.
+
+        :param obs: Observation
+        :param actions: Actions
+        :return: estimated value, log likelihood of taking those actions
+            and entropy of the action distribution.
+        """
+        # Preprocess the observation if needed
+        # features = self.extract_features(obs)
+        # if self.share_features_extractor:
+        #     latent_pi, latent_vf = self.mlp_extractor(features)
+        # else:
+        #     pi_features, vf_features = features
+        #     latent_pi = self.mlp_extractor.forward_actor(pi_features)
+        #     latent_vf = self.mlp_extractor.forward_critic(vf_features)
+        distribution = self._get_action_dist_from_obs(obs)
+        log_prob = distribution.log_prob(actions)
+        values = self.gnn.forward_critic(obs)
+        entropy = distribution.entropy()
+        return values, log_prob, entropy
+
+    def get_distribution(self, obs: thg.data.Data) -> Distribution:
+        """
+        Get the current policy distribution given the observations.
+
+        :param obs:
+        :return: the action distribution.
+        """
+        # features = super().extract_features(obs, self.pi_features_extractor)
+        # latent_pi = self.mlp_extractor.forward_actor(features)
+
+        return self._get_action_dist_from_obs(obs)
+
+    def predict_values(self, obs: thg.data.Data) -> th.Tensor:
+        """
+        Get the estimated values according to the current policy given the observations.
+
+        :param obs: Observation
+        :return: the estimated values.
+        """
+        # features = super().extract_features(obs, self.vf_features_extractor)
+        # latent_vf = self.mlp_extractor.forward_critic(features)
+        return self.gnn.forward_critic(obs)
+
+
+
+# GNN AC Policy if only Extractor is a GNN 
+
+class GNNActorCriticPolicy2(ActorCriticPolicy):
+    """
+    Policy class for actor-critic algorithms (has both policy and value prediction).
+    Used by A2C, PPO and the likes.
+
+    :param observation_space: Observation space
+    :param action_space: Action space
+    :param lr_schedule: Learning rate schedule (could be constant)
+    :param net_arch: The specification of the policy and value networks.
+    :param activation_fn: Activation function
+    :param ortho_init: Whether to use or not orthogonal initialization
+    :param use_sde: Whether to use State Dependent Exploration or not
+    :param log_std_init: Initial value for the log standard deviation
+    :param full_std: Whether to use (n_features x n_actions) parameters
+        for the std instead of only (n_features,) when using gSDE
+    :param use_expln: Use ``expln()`` function instead of ``exp()`` to ensure
+        a positive standard deviation (cf paper). It allows to keep variance
+        above zero and prevent it from growing too fast. In practice, ``exp()`` is usually enough.
+    :param squash_output: Whether to squash the output using a tanh function,
+        this allows to ensure boundaries when using gSDE.
+    :param features_extractor_class: Features extractor to use.
+    :param features_extractor_kwargs: Keyword arguments
+        to pass to the features extractor.
+    :param share_features_extractor: If True, the features extractor is shared between the policy and value networks.
+    :param normalize_images: Whether to normalize images or not,
+         dividing by 255.0 (True by default)
+    :param optimizer_class: The optimizer to use,
+        ``th.optim.Adam`` by default
+    :param optimizer_kwargs: Additional keyword arguments,
+        excluding the learning rate, to pass to the optimizer
+    """
+
+    def __init__(
+        self,
+        # observation_space: spaces.Space,
+        observation_space: spaces.Graph,
+        action_space: spaces.Space,
+        lr_schedule: Schedule,
+        net_arch: Optional[Union[List[int], Dict[str, List[int]]]] = None,
+        activation_fn: Type[nn.Module] = nn.Tanh,
+        ortho_init: bool = True,
+        use_sde: bool = False,
+        log_std_init: float = 0.0,
+        full_std: bool = True,
+        use_expln: bool = False,
+        squash_output: bool = False,
+        features_extractor_class: Type[BaseFeaturesExtractor] = GraphFeaturesExtractor,
+        features_extractor_kwargs: Optional[Dict[str, Any]] = None,
+        share_features_extractor: bool = True,
+        normalize_images: bool = True,
+        optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
+        optimizer_kwargs: Optional[Dict[str, Any]] = None,
+    ):
+        if optimizer_kwargs is None:
+            optimizer_kwargs = {}
+            # Small values to avoid NaN in Adam optimizer
+            if optimizer_class == th.optim.Adam:
+                optimizer_kwargs["eps"] = 1e-5
+
+        super().__init__(
+            observation_space,
+            action_space,
+            lr_schedule, 
+            net_arch,
+            activation_fn,
+            ortho_init,
+            use_sde, 
+            log_std_init, 
+            full_std, 
+            use_expln, 
+            squash_output,
+            features_extractor_class,
+            features_extractor_kwargs,
+            share_features_extractor,
+            normalize_images, 
+            optimizer_class,
+            optimizer_kwargs,
+        )
+
+    def obs_to_tensor(self, observation: spaces.GraphInstance):
+        if isinstance(observation, list):
+            vectorized_env = True
+        else:
+            vectorized_env = False
+        if vectorized_env:
+            torch_obs = list()
+            for obs in observation:
+                x = th.tensor(obs.nodes).float()
+                edge_index = th.tensor(obs.edge_links, dtype=th.long).t().contiguous().view(2, -1)
+                torch_obs.append(thg.data.Data(x=x, edge_index=edge_index))
+            if len(torch_obs) == 1:
+                torch_obs = torch_obs[0]
+        else:
+            x = th.tensor(observation.nodes).float()
+            edge_index = th.tensor(observation.edge_links, dtype=th.long).t().contiguous().view(2, -1)
+            torch_obs = thg.data.Data(x=x, edge_index=edge_index)
+        return torch_obs, vectorized_env
+
+   
+    def forward(self, obs: thg.data.Data, deterministic: bool = False) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
+        """
+        Forward pass in all the networks (actor and critic)
+
+        :param obs: Observation
+        :param deterministic: Whether to sample or use deterministic actions
+        :return: action, value and log probability of the action
+        """
+        # Preprocess the observation if needed
+        features = self.extract_features(obs)
+        if self.share_features_extractor:
+            latent_pi, latent_vf = self.mlp_extractor(features)
+        else:
+            pi_features, vf_features = features
+            latent_pi = self.mlp_extractor.forward_actor(pi_features)
+            latent_vf = self.mlp_extractor.forward_critic(vf_features)
+        # Evaluate the values for the given observations
+        values = self.value_net(latent_vf)
+
+        distribution = self._get_action_dist_from_latent(latent_pi)
+        actions = distribution.get_actions(deterministic=deterministic)
+        log_prob = distribution.log_prob(actions)
+        actions = actions.reshape((-1, *self.action_space.shape))  # type: ignore[misc]
+        return actions, values, log_prob
+
+
+    def _predict(self, observation: thg.data.Data, deterministic: bool = False) -> th.Tensor:
+        """
+        Get the action according to the policy for a given observation.
+
+        :param observation:
+        :param deterministic: Whether to use stochastic or deterministic actions
+        :return: Taken action according to the policy
+        """
+        return self.get_distribution(observation).get_actions(deterministic=deterministic)
+
+ 
+    def evaluate_actions(self, obs: thg.data.Data, actions: th.Tensor) -> Tuple[th.Tensor, th.Tensor, Optional[th.Tensor]]:
+        """
+        Evaluate actions according to the current policy,
+        given the observations.
+
+        :param obs: Observation
+        :param actions: Actions
+        :return: estimated value, log likelihood of taking those actions
+            and entropy of the action distribution.
+        """
+        # Preprocess the observation if needed
+        features = self.extract_features(obs)
+        if self.share_features_extractor:
+            latent_pi, latent_vf = self.mlp_extractor(features)
+        else:
+            pi_features, vf_features = features
+            latent_pi = self.mlp_extractor.forward_actor(pi_features)
+            latent_vf = self.mlp_extractor.forward_critic(vf_features)
+        distribution = self._get_action_dist_from_latent(latent_pi)
+        log_prob = distribution.log_prob(actions)
+        values = self.gnn.forward_critic(obs)
+        entropy = distribution.entropy()
+        return values, log_prob, entropy
+
+    def get_distribution(self, obs: thg.data.Data) -> Distribution:
+        """
+        Get the current policy distribution given the observations.
+
+        :param obs:
+        :return: the action distribution.
+        """
+        features = super().extract_features(obs, self.pi_features_extractor)
+        latent_pi = self.mlp_extractor.forward_actor(features)
+        return self._get_action_dist_from_latent(latent_pi)
+
+    def predict_values(self, obs: thg.data.Data) -> th.Tensor:
+        """
+        Get the estimated values according to the current policy given the observations.
+
+        :param obs: Observation
+        :return: the estimated values.
+        """
+        features = super().extract_features(obs, self.vf_features_extractor)
+        latent_vf = self.mlp_extractor.forward_critic(features)
+        return self.value_net(latent_vf)

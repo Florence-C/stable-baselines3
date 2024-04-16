@@ -4,10 +4,14 @@ import gymnasium as gym
 import torch as th
 from gymnasium import spaces
 from torch import nn
+from torch.nn import Linear, ReLU, Dropout, Tanh
 
 from stable_baselines3.common.preprocessing import get_flattened_obs_dim, is_image_space
 from stable_baselines3.common.type_aliases import TensorDict
 from stable_baselines3.common.utils import get_device
+
+import torch_geometric as thg
+from torch_geometric.nn import GCNConv, SAGEConv, GATConv, global_max_pool, BatchNorm, global_mean_pool, Sequential
 
 
 class BaseFeaturesExtractor(nn.Module):
@@ -276,6 +280,161 @@ class CombinedExtractor(BaseFeaturesExtractor):
         for key, extractor in self.extractors.items():
             encoded_tensor_list.append(extractor(observations[key]))
         return th.cat(encoded_tensor_list, dim=1)
+
+
+## To do : add more params to extractor (activation, number and size of layers)
+class GraphFeaturesExtractor(BaseFeaturesExtractor):
+    """
+    Graph feature extractor for Graph observation spaces.
+    Build a graph convolutional network for belief state extraction
+    
+    :param observation_space:
+    :param output_dim: Number of features to output from GNN. 
+    """
+    
+    def __init__(self, observation_space: gym.spaces.Graph,
+                 gnn_output_dim: int = 64, model='GCN'):
+        super().__init__(observation_space, features_dim=gnn_output_dim)
+        self._features_dim = gnn_output_dim
+        node_feature_num = observation_space.node_space.shape[0]
+        self.num_nodes = 3
+    
+        if model == 'GCN':
+            self.conv_layer = GCNConv(node_feature_num, 2*gnn_output_dim)
+        elif model == 'SAGE':
+            self.conv_layer = SAGEConv(node_feature_num, 2*gnn_output_dim)
+        elif model == 'GAT':
+            self.conv_layer = GATConv(node_feature_num, 2*gnn_output_dim)
+        
+        self.conv_layer2 = GCNConv(2*gnn_output_dim, gnn_output_dim) # new layer 
+        # self.linear_layer = nn.Linear(2*gnn_output_dim, gnn_output_dim)
+        self.linear_layer = nn.Linear(self.num_nodes*gnn_output_dim, gnn_output_dim)
+    
+    def forward(self, observations: thg.data.Data):
+        x, edge_index, batch = observations.x, observations.edge_index, observations.batch
+
+        h = self.conv_layer(x, edge_index).relu()
+        h = self.conv_layer2(h, edge_index).relu()
+
+        if batch is None :
+            (a,b) = h.shape
+            h = h.view(a*b)
+        else : 
+            (bs,b) = h.shape
+            h = h.view(-1, self.num_nodes*b) # 3 is num nodes
+
+        # # print("h before mean pooling : ", h.shape)
+        # # # h = global_max_pool(h, batch)
+        # # h = global_mean_pool(h, batch)
+        # # print("h after mean pooling : ", h)
+        h = self.linear_layer(h).relu()
+        return h
+
+class GNNModule(nn.Module):
+    """
+    Constructs an MLP that receives the output from a previous features extractor (i.e. a CNN) or directly
+    the observations (if no features extractor is applied) as an input and outputs a latent representation
+    for the policy and a value network.
+
+    The ``net_arch`` parameter allows to specify the amount and size of the hidden layers.
+    It can be in either of the following forms:
+    1. ``dict(vf=[<list of layer sizes>], pi=[<list of layer sizes>])``: to specify the amount and size of the layers in the
+        policy and value nets individually. If it is missing any of the keys (pi or vf),
+        zero layers will be considered for that key.
+    2. ``[<list of layer sizes>]``: "shortcut" in case the amount and size of the layers
+        in the policy and value nets are the same. Same as ``dict(vf=int_list, pi=int_list)``
+        where int_list is the same for the actor and critic.
+
+    .. note::
+        If a key is not specified or an empty list is passed ``[]``, a linear network will be used.
+
+    :param feature_dim: Dimension of the feature vector (can be the output of a CNN)
+    :param net_arch: The specification of the policy and value networks.
+        See above for details on its formatting.
+    :param activation_fn: The activation function to use for the networks.
+    :param device: PyTorch device.
+    """
+
+    def __init__(
+        self,
+        # feature_dim: int,
+        # net_arch: Union[List[int], Dict[str, List[int]]],
+        # activation_fn: Type[nn.Module],
+        observation_space: gym.spaces.Graph,  
+        device: Union[th.device, str] = "auto",
+        gnn_output_dim = 64, model='GCN',
+    ) -> None:
+
+        super().__init__()
+
+        self._features_dim = gnn_output_dim
+        node_feature_num = observation_space.node_space.shape[0]
+        self.num_nodes = 3
+    
+        if model == 'GCN':
+            self.conv_layer = GCNConv(node_feature_num, 2*gnn_output_dim)
+        elif model == 'SAGE':
+            self.conv_layer = SAGEConv(node_feature_num, 2*gnn_output_dim)
+        elif model == 'GAT':
+            self.conv_layer = GATConv(node_feature_num, 2*gnn_output_dim)
+        
+        self.conv_layer2 = GCNConv(2*gnn_output_dim, gnn_output_dim) # new layer 
+
+        self.conv_layer_action = GCNConv(gnn_output_dim, 1)
+
+        device = get_device(device)
+
+        policy_net: List[nn.Module] = []
+        value_net: List[nn.Module] = []
+        # last_layer_dim_pi = feature_dim
+        # last_layer_dim_vf = feature_dim
+
+        self.policy_net = Sequential('x, edge_index', [
+        (self.conv_layer, 'x, edge_index -> x'),
+        ReLU(inplace=True),
+        (self.conv_layer2, 'x, edge_index -> x'),
+        ReLU(inplace=True),
+        (self.conv_layer_action, 'x, edge_index -> x'),
+        Tanh(),
+        ]).to(device)
+
+        self.value_net = Sequential('x, edge_index, batch', [
+        (self.conv_layer, 'x, edge_index -> x'),
+        ReLU(inplace=True),
+        (self.conv_layer2, 'x, edge_index -> x'),
+        ReLU(inplace=True),
+        (global_mean_pool, 'x, batch -> x'),
+        Linear(gnn_output_dim, 1),
+        ]).to(device)
+
+
+   
+    def forward(self, observations: thg.data.Data):
+      
+        return self.forward_actor(observations), self.forward_critic(observations)
+
+    def forward_actor(self, observations: thg.data.Data) -> th.Tensor:
+        x, edge_index, batch = observations.x, observations.edge_index, observations.batch
+        action = self.policy_net(x, edge_index)
+        # print("action before = ", action, action.shape) 
+        if batch is None :
+            (a,bs) = action.shape
+            action = action.view(bs,a)
+        else : 
+            (a,bs) = action.shape
+            action = action.view(-1, 3) # 3 in num_nodes
+
+        # print("action after = ", action, action.shape)
+
+        return action
+
+    def forward_critic(self, observations: thg.data.Data) -> th.Tensor:
+        x, edge_index, batch = observations.x, observations.edge_index, observations.batch
+        value = self.value_net(x, edge_index, batch)
+        # print('value = ', value, value.shape)
+        return value
+
+
 
 
 def get_actor_critic_arch(net_arch: Union[List[int], Dict[str, List[int]]]) -> Tuple[List[int], List[int]]:

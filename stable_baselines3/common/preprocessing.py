@@ -113,6 +113,9 @@ def preprocess_obs(
             preprocessed_obs[key] = preprocess_obs(_obs, observation_space[key], normalize_images=normalize_images)
         return preprocessed_obs  # type: ignore[return-value]
 
+    elif isinstance(observation_space, spaces.Graph): 
+        return obs
+
     assert isinstance(obs, th.Tensor), f"Expecting a torch Tensor, but got {type(obs)}"
 
     if isinstance(observation_space, spaces.Box):
@@ -162,7 +165,8 @@ def get_obs_shape(
         return observation_space.shape
     elif isinstance(observation_space, spaces.Dict):
         return {key: get_obs_shape(subspace) for (key, subspace) in observation_space.spaces.items()}  # type: ignore[misc]
-
+    elif isinstance(observation_space, spaces.Graph):
+        return observation_space.node_space.shape + observation_space.edge_space.shape
     else:
         raise NotImplementedError(f"{observation_space} observation space is not supported")
 

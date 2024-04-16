@@ -20,7 +20,15 @@ def copy_obs_dict(obs: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
     :return: a dict of copied numpy arrays.
     """
     assert isinstance(obs, OrderedDict), f"unexpected type for observations '{type(obs)}'"
-    return OrderedDict([(k, np.copy(v)) for k, v in obs.items()])
+    # return OrderedDict([(k, np.copy(v)) for k, v in obs.items()])
+    obs_dict_list = list()
+    for k, v in obs.items():
+        if isinstance(v[0], spaces.GraphInstance):
+            obs_dict_list.append((k, v))
+        else:
+            obs_dict_list.append((k, np.copy(v)))
+    result_dict = OrderedDict(obs_dict_list)
+    return result_dict
 
 
 def dict_to_obs(obs_space: spaces.Space, obs_dict: Dict[Any, np.ndarray]) -> VecEnvObs:
@@ -39,6 +47,8 @@ def dict_to_obs(obs_space: spaces.Space, obs_dict: Dict[Any, np.ndarray]) -> Vec
     elif isinstance(obs_space, spaces.Tuple):
         assert len(obs_dict) == len(obs_space.spaces), "size of observation does not match size of observation space"
         return tuple(obs_dict[i] for i in range(len(obs_space.spaces)))
+    elif isinstance(obs_space, spaces.Graph):
+        return obs_dict[None]
     else:
         assert set(obs_dict.keys()) == {None}, "multiple observation keys for unstructured observation space"
         return obs_dict[None]

@@ -7,7 +7,7 @@ import torch as th
 from gymnasium import spaces
 
 from stable_baselines3.common.base_class import BaseAlgorithm
-from stable_baselines3.common.buffers import DictRolloutBuffer, RolloutBuffer
+from stable_baselines3.common.buffers import DictRolloutBuffer, RolloutBuffer, GraphRolloutBuffer
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
@@ -118,6 +118,8 @@ class OnPolicyAlgorithm(BaseAlgorithm):
         if self.rollout_buffer_class is None:
             if isinstance(self.observation_space, spaces.Dict):
                 self.rollout_buffer_class = DictRolloutBuffer
+            elif isinstance(self.observation_space, spaces.Graph):
+                self.rollout_buffer_class = GraphRolloutBuffer
             else:
                 self.rollout_buffer_class = RolloutBuffer
 
@@ -175,7 +177,11 @@ class OnPolicyAlgorithm(BaseAlgorithm):
 
             with th.no_grad():
                 # Convert to pytorch tensor or to TensorDict
-                obs_tensor = obs_as_tensor(self._last_obs, self.device)
+                if isinstance(self._last_obs[0], spaces.GraphInstance):
+                    obs_tensor = self.policy.obs_to_tensor(self._last_obs[0])[0]
+                    obs_tensor = obs_tensor.to(self.device)
+                else: 
+                    obs_tensor = obs_as_tensor(self._last_obs, self.device)
                 actions, values, log_probs = self.policy(obs_tensor)
             actions = actions.cpu().numpy()
 
@@ -234,7 +240,14 @@ class OnPolicyAlgorithm(BaseAlgorithm):
 
         with th.no_grad():
             # Compute value for the last timestep
-            values = self.policy.predict_values(obs_as_tensor(new_obs, self.device))  # type: ignore[arg-type]
+            if isinstance(new_obs[0], spaces.GraphInstance):
+                new_obs_tensor =  self.policy.obs_to_tensor(new_obs[0])[0]
+                new_obs_tensor = new_obs_tensor.to(self.device)
+            else: 
+                new_obs_tensor = obs_as_tensor(new_obs, self.device)
+            # values = self.policy.predict_values(obs_as_tensor(new_obs, self.device))  # type: ignore[arg-type]
+            values = self.policy.predict_values(new_obs_tensor)
+            #values = self.policy.predict_values(obs_as_tensor(new_obs, self.device))  # type: ignore[arg-type]
 
         rollout_buffer.compute_returns_and_advantage(last_values=values, dones=dones)
 
