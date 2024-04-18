@@ -11,7 +11,7 @@ from stable_baselines3.common.type_aliases import TensorDict
 from stable_baselines3.common.utils import get_device
 
 import torch_geometric as thg
-from torch_geometric.nn import GCNConv, SAGEConv, GATConv, global_max_pool, BatchNorm, global_mean_pool, Sequential
+from torch_geometric.nn import GCNConv, SAGEConv, GATConv, global_max_pool, BatchNorm, global_mean_pool, Sequential, GraphConv
 
 
 class BaseFeaturesExtractor(nn.Module):
@@ -362,49 +362,72 @@ class GNNModule(nn.Module):
         # activation_fn: Type[nn.Module],
         observation_space: gym.spaces.Graph,  
         device: Union[th.device, str] = "auto",
-        gnn_output_dim = 64, model='GCN',
+        gnn_dim = 128, model='GCN',
     ) -> None:
 
         super().__init__()
 
-        self._features_dim = gnn_output_dim
+        self._features_dim = gnn_dim
         node_feature_num = observation_space.node_space.shape[0]
         self.num_nodes = 3
+
+        print("model = ", model)
     
         if model == 'GCN':
-            self.conv_layer = GCNConv(node_feature_num, 2*gnn_output_dim)
-        elif model == 'SAGE':
-            self.conv_layer = SAGEConv(node_feature_num, 2*gnn_output_dim)
-        elif model == 'GAT':
-            self.conv_layer = GATConv(node_feature_num, 2*gnn_output_dim)
-        
-        self.conv_layer2 = GCNConv(2*gnn_output_dim, gnn_output_dim) # new layer 
+            self.conv_layer_p1 = GCNConv(node_feature_num, gnn_dim)
+            self.conv_layer_p2 = GCNConv(gnn_dim, gnn_dim)
+            self.conv_layer_action = GCNConv(gnn_dim, 1)
 
-        self.conv_layer_action = GCNConv(gnn_output_dim, 1)
+            self.conv_layer_v1 = GCNConv(node_feature_num, gnn_dim)
+            self.conv_layer_v2 = GCNConv(gnn_dim, gnn_dim)
+            self.lin = Linear(gnn_dim, 1)
+
+
+        elif model == 'SAGE':
+            self.conv_layer_p1 = SAGEConv(node_feature_num, gnn_dim)
+            self.conv_layer_p2 = SAGEConv(gnn_dim, gnn_dim)
+            self.conv_layer_action = SAGEConv(gnn_dim, 1)
+
+            self.conv_layer_v1 = SAGEConv(node_feature_num, gnn_dim)
+            self.conv_layer_v2 = SAGEConv(gnn_dim, gnn_dim)
+            self.lin = Linear(gnn_dim, 1)
+
+        elif model == 'GAT':
+            self.conv_layer_p1 = GATConv(node_feature_num, gnn_dim)
+            self.conv_layer_p2 = GATConv(gnn_dim, gnn_dim)
+            self.conv_layer_action = GATConv(gnn_dim, 1)
+
+            self.conv_layer_v1 = GATConv(node_feature_num, gnn_dim)
+            self.conv_layer_v2 = GATConv(gnn_output_dim, gnn_dim)
+            self.lin = Linear(gnn_dim, 1)
+        elif model == 'GraphConv' : 
+            self.conv_layer_p1 = GraphConv(node_feature_num, gnn_dim)
+            self.conv_layer_p2 = GraphConv(gnn_dim, gnn_dim)
+            self.conv_layer_action = GraphConv(gnn_dim, 1)
+
+            self.conv_layer_v1 = GraphConv(node_feature_num, gnn_dim)
+            self.conv_layer_v2 = GraphConv(gnn_dim, gnn_dim)
+            self.lin = Linear(gnn_dim, 1)
+    
+        
 
         device = get_device(device)
 
-        policy_net: List[nn.Module] = []
-        value_net: List[nn.Module] = []
-        # last_layer_dim_pi = feature_dim
-        # last_layer_dim_vf = feature_dim
-
         self.policy_net = Sequential('x, edge_index', [
-        (self.conv_layer, 'x, edge_index -> x'),
+        (self.conv_layer_p1, 'x, edge_index -> x'),
         ReLU(inplace=True),
-        (self.conv_layer2, 'x, edge_index -> x'),
+        (self.conv_layer_p2, 'x, edge_index -> x'),
         ReLU(inplace=True),
         (self.conv_layer_action, 'x, edge_index -> x'),
-        Tanh(),
+        #Tanh(),
         ]).to(device)
 
         self.value_net = Sequential('x, edge_index, batch', [
-        (self.conv_layer, 'x, edge_index -> x'),
+        (self.conv_layer_v1, 'x, edge_index -> x'),
         ReLU(inplace=True),
-        (self.conv_layer2, 'x, edge_index -> x'),
-        ReLU(inplace=True),
+        (self.conv_layer_v2, 'x, edge_index -> x'),
         (global_mean_pool, 'x, batch -> x'),
-        Linear(gnn_output_dim, 1),
+        self.lin,
         ]).to(device)
 
 

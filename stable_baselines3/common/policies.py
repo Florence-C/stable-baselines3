@@ -1044,12 +1044,17 @@ class GNNActorCriticPolicy(ActorCriticPolicy):
         normalize_images: bool = True,
         optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
+        gnn_model = 'GCN', 
+        gnn_dim = 128, 
     ):
         if optimizer_kwargs is None:
             optimizer_kwargs = {}
             # Small values to avoid NaN in Adam optimizer
             if optimizer_class == th.optim.Adam:
                 optimizer_kwargs["eps"] = 1e-5
+
+        self.gnn_model = gnn_model
+        self.gnn_dim = gnn_dim
 
         super().__init__(
             observation_space,
@@ -1072,21 +1077,6 @@ class GNNActorCriticPolicy(ActorCriticPolicy):
         )
 
 
-    def _build_gnn_extractor(self) -> None:
-        """
-        Create the policy and value networks.
-        Part of the layers can be shared.
-        """
-        # Note: If net_arch is None and some features extractor is used,
-        #       net_arch here is an empty list and mlp_extractor does not
-        #       really contain any layers (acts like an identity module).
-        self.mlp_extractor = GNNExtractor(
-            self.features_dim,
-            net_arch=self.net_arch,
-            activation_fn=self.activation_fn,
-            device=self.device,
-        )
-
 
     def _build(self, lr_schedule: Schedule) -> None:
         """
@@ -1096,26 +1086,7 @@ class GNNActorCriticPolicy(ActorCriticPolicy):
             lr_schedule(1) is the initial learning rate
         """
 
-        self.gnn = GNNModule(self.observation_space)
-
-
-        # latent_dim_pi = self.mlp_extractor.latent_dim_pi
-
-        # if isinstance(self.action_dist, DiagGaussianDistribution):
-        #     self.action_net, self.log_std = self.action_dist.proba_distribution_net(
-        #         latent_dim=latent_dim_pi, log_std_init=self.log_std_init
-        #     )
-        # elif isinstance(self.action_dist, StateDependentNoiseDistribution):
-        #     self.action_net, self.log_std = self.action_dist.proba_distribution_net(
-        #         latent_dim=latent_dim_pi, latent_sde_dim=latent_dim_pi, log_std_init=self.log_std_init
-        #     )
-        # elif isinstance(self.action_dist, (CategoricalDistribution, MultiCategoricalDistribution, BernoulliDistribution)):
-        #     self.action_net = self.action_dist.proba_distribution_net(latent_dim=latent_dim_pi)
-        # else:
-        #     raise NotImplementedError(f"Unsupported distribution '{self.action_dist}'.")
-
-        # self.value_net = nn.Linear(self.mlp_extractor.latent_dim_vf, 1)
-
+        self.gnn = GNNModule(self.observation_space, model=self.gnn_model, gnn_dim=self.gnn_dim)
 
         self.value_net = self.gnn.value_net
         self.action_net = self.gnn.policy_net
@@ -1123,6 +1094,7 @@ class GNNActorCriticPolicy(ActorCriticPolicy):
 
         # Init weights: use orthogonal initialization
         # with small initial weight for the output
+        print('ortho_init = ', self.ortho_init)
         if self.ortho_init:
             # TODO: check for features_extractor
             # Values from stable-baselines.
@@ -1131,8 +1103,8 @@ class GNNActorCriticPolicy(ActorCriticPolicy):
             module_gains = {
                 #self.features_extractor: np.sqrt(2),
                 #self.mlp_extractor: np.sqrt(2),
-                self.action_net: 0.01,
-                self.value_net: 1,
+                self.action_net: np.sqrt(2), # 0.01,
+                self.value_net: np.sqrt(2), #1,
             }
             # if not self.share_features_extractor:
             #     # Note(antonin): this is to keep SB3 results
