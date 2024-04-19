@@ -31,7 +31,8 @@ from stable_baselines3.common.torch_layers import (
     NatureCNN,
     create_mlp,
     GraphFeaturesExtractor, 
-    GNNModule
+    GNNModule, 
+    NoneExtractor
 )
 from stable_baselines3.common.type_aliases import PyTorchObs, Schedule
 from stable_baselines3.common.utils import get_device, is_vectorized_observation, obs_as_tensor
@@ -1038,7 +1039,7 @@ class GNNActorCriticPolicy(ActorCriticPolicy):
         full_std: bool = True,
         use_expln: bool = False,
         squash_output: bool = False,
-        features_extractor_class: Type[BaseFeaturesExtractor] = GraphFeaturesExtractor,
+        features_extractor_class: Type[BaseFeaturesExtractor] = NoneExtractor,
         features_extractor_kwargs: Optional[Dict[str, Any]] = None,
         share_features_extractor: bool = True,
         normalize_images: bool = True,

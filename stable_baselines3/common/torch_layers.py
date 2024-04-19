@@ -33,6 +33,21 @@ class BaseFeaturesExtractor(nn.Module):
         return self._features_dim
 
 
+class NoneExtractor(BaseFeaturesExtractor):
+    """
+    Empty extractor
+    Used as a placeholder when feature extraction is not needed.
+
+    :param observation_space:
+    """
+
+    def __init__(self, observation_space: gym.Space) -> None:
+        # (node_features, edge_features) = get_obs_shape(observation_space)
+        super().__init__(observation_space, get_flattened_obs_dim(observation_space))
+
+    def forward(self, observations):
+        return observations
+
 class FlattenExtractor(BaseFeaturesExtractor):
     """
     Feature extract that flatten the input.
@@ -369,7 +384,6 @@ class GNNModule(nn.Module):
 
         self._features_dim = gnn_dim
         node_feature_num = observation_space.node_space.shape[0]
-        self.num_nodes = 3
 
         print("model = ", model)
     
@@ -439,22 +453,18 @@ class GNNModule(nn.Module):
     def forward_actor(self, observations: thg.data.Data) -> th.Tensor:
         x, edge_index, batch = observations.x, observations.edge_index, observations.batch
         action = self.policy_net(x, edge_index)
-        # print("action before = ", action, action.shape) 
         if batch is None :
-            (a,bs) = action.shape
-            action = action.view(bs,a)
+            (a,b) = action.shape
+            action = action.view(b,a)
         else : 
-            (a,bs) = action.shape
-            action = action.view(-1, 3) # 3 in num_nodes
-
-        # print("action after = ", action, action.shape)
+            bs = batch.unique().size()[0]
+            action = action.view(bs,-1) #action shape will be (bs,num_nodes) (was num_nodes*bs,1)
 
         return action
 
     def forward_critic(self, observations: thg.data.Data) -> th.Tensor:
         x, edge_index, batch = observations.x, observations.edge_index, observations.batch
         value = self.value_net(x, edge_index, batch)
-        # print('value = ', value, value.shape)
         return value
 
 
