@@ -185,6 +185,9 @@ def get_flattened_obs_dim(observation_space: spaces.Space) -> int:
     # it may be a problem for Dict/Tuple spaces too...
     if isinstance(observation_space, spaces.MultiDiscrete):
         return sum(observation_space.nvec)
+    elif isinstance(observation_space, spaces.Graph): 
+        (node_features, edge_features) = get_obs_shape(observation_space)
+        return node_features * edge_features
     else:
         # Use Gym internal method
         return spaces.utils.flatdim(observation_space)
